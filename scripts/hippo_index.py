@@ -74,6 +74,17 @@ def graph_query(r: redis.Redis, db: str, cypher: str, params: dict | None = None
     return r.execute_command("GRAPH.QUERY", db, cypher)
 
 
+def parse_graph_result(result: list) -> list[dict]:
+    """Parse FalkorDB GRAPH.QUERY result into list of dicts."""
+    if not result or len(result) < 2:
+        return []
+    header = result[0]
+    rows = result[1] if len(result) > 1 else []
+    if not header or not rows:
+        return []
+    return [dict(zip(header, row)) for row in rows]
+
+
 def insert_triple(r: redis.Redis, db: str, subject: str, relation: str, obj: str,
                   source: str, timestamp: str):
     """Insert a single triple into the graph."""
@@ -123,6 +134,9 @@ Rules:
 - Entities should be specific and normalized (proper nouns preserved, common nouns lowercase)
 - Relations should be verb phrases (e.g., "decided-to-use", "is-a", "relates-to")
 - Keep entities concise (1-4 words)
+- SKIP placeholder values like "none", "not yet", "not yet observed", "unknown", "0", "true", "false", "null"
+- SKIP template text in square brackets like "[Not yet assessed]"
+- Only extract substantive, meaningful relationships
 - {hint}
 
 Output ONLY valid JSON in this exact format, nothing else:
@@ -181,28 +195,60 @@ Text:
 
 def embed_text(text: str, secrets: dict, input_type: str = "passage") -> list[float] | None:
     """Get embedding from TELUS AI."""
+    result = embed_batch([text], secrets, input_type)
+    return result[0] if result else None
+
+
+def embed_batch(texts: list[str], secrets: dict, input_type: str = "passage") -> list[list[float] | None]:
+    """Batch embed texts via TELUS AI. Returns list of embeddings (None for failures)."""
     url = secrets.get("TELUS_EMBED_URL", "")
     key = secrets.get("TELUS_EMBED_KEY", "")
 
     if not url or not key:
-        return None
+        return [None] * len(texts)
 
-    try:
-        with httpx.Client(timeout=15) as client:
-            resp = client.post(
-                url,
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                json={
-                    "input": [text],
-                    "model": "nvidia/nv-embedqa-e5-v5",
-                    "input_type": input_type,
-                },
-            )
-            resp.raise_for_status()
-            return resp.json()["data"][0]["embedding"]
-    except (httpx.HTTPError, KeyError, IndexError) as e:
-        print(f"  Warning: Embedding failed for '{text[:50]}': {e}", file=sys.stderr)
-        return None
+    results = [None] * len(texts)
+    # API typically supports batches of ~96 inputs
+    batch_size = 64
+
+    for start in range(0, len(texts), batch_size):
+        batch = texts[start:start + batch_size]
+        try:
+            with httpx.Client(timeout=30) as client:
+                resp = client.post(
+                    url,
+                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                    json={
+                        "input": batch,
+                        "model": "nvidia/nv-embedqa-e5-v5",
+                        "input_type": input_type,
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()["data"]
+                for item in data:
+                    idx = item["index"]
+                    results[start + idx] = item["embedding"]
+        except (httpx.HTTPError, KeyError, IndexError) as e:
+            print(f"  Warning: Batch embedding failed (offset {start}): {e}", file=sys.stderr)
+
+    return results
+
+
+def store_entity_embeddings(r: redis.Redis, db: str, entities: list[str],
+                           embeddings: list[list[float] | None]):
+    """Store embeddings on entity nodes in FalkorDB."""
+    for entity, emb in zip(entities, embeddings):
+        if emb is None:
+            continue
+        esc = entity.replace('"', '\\"')
+        # Store as JSON string property (FalkorDB doesn't support native vector type)
+        emb_json = json.dumps(emb)
+        cypher = f'MATCH (n:Entity {{name: "{esc}"}}) SET n.embedding = \'{emb_json}\''
+        try:
+            graph_query(r, db, cypher)
+        except redis.exceptions.ResponseError as e:
+            print(f"  Warning: Failed to store embedding for '{entity}': {e}", file=sys.stderr)
 
 
 # --- Content type detection ---
@@ -340,6 +386,25 @@ def index_file(filepath: str, content_type: str | None, config: dict, secrets: d
     entity_count = len(entities)
     print(f"    {triples_count} triples, {entity_count} entities")
 
+    # Embed entities that don't already have embeddings
+    entity_list = sorted(entities)
+    # Check which entities need embeddings
+    needs_embedding = []
+    for ent in entity_list:
+        esc = ent.replace('"', '\\"')
+        try:
+            result = graph_query(r, db, f'MATCH (n:Entity {{name: "{esc}"}}) WHERE n.embedding IS NOT NULL RETURN n.name')
+            if not result or not result[1]:
+                needs_embedding.append(ent)
+        except redis.exceptions.ResponseError:
+            needs_embedding.append(ent)
+
+    if needs_embedding:
+        embs = embed_batch(needs_embedding, secrets, input_type="passage")
+        store_entity_embeddings(r, db, needs_embedding, embs)
+        embedded_count = sum(1 for e in embs if e is not None)
+        print(f"    {embedded_count}/{len(needs_embedding)} entities embedded")
+
     # Mark indexed
     mark_indexed(filepath, ct, triples_count, entity_count)
 
@@ -442,6 +507,26 @@ def index_pending(config: dict, secrets: dict, r: redis.Redis):
     print(f"Done: {total_triples} triples, {total_entities} entities from {len(lines)} files")
 
 
+def embed_missing_entities(config: dict, secrets: dict, r: redis.Redis):
+    """Embed all entities that don't have embeddings yet."""
+    db = config["backend"]["database"]
+
+    # Find entities without embeddings
+    cypher = 'MATCH (n:Entity) WHERE n.embedding IS NULL RETURN n.name'
+    rows = parse_graph_result(graph_query(r, db, cypher))
+    names = [row["n.name"] for row in rows]
+
+    if not names:
+        print("All entities already have embeddings.")
+        return
+
+    print(f"Embedding {len(names)} entities...")
+    embs = embed_batch(names, secrets, input_type="passage")
+    store_entity_embeddings(r, db, names, embs)
+    embedded = sum(1 for e in embs if e is not None)
+    print(f"Done: {embedded}/{len(names)} entities embedded.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Hippo indexing pipeline")
     parser.add_argument("path", nargs="?", help="File or directory to index")
@@ -450,6 +535,8 @@ def main():
     parser.add_argument("--all", action="store_true", help="Index all configured sources")
     parser.add_argument("--pending", action="store_true", help="Process pending index queue")
     parser.add_argument("--force", action="store_true", help="Reindex even if unchanged")
+    parser.add_argument("--embed-missing", action="store_true",
+                        help="Embed all entities that don't have embeddings yet")
     args = parser.parse_args()
 
     if not CONFIG_FILE.exists():
@@ -468,7 +555,9 @@ def main():
         print("Run: systemctl --user start hippo-graph", file=sys.stderr)
         sys.exit(1)
 
-    if args.all:
+    if args.embed_missing:
+        embed_missing_entities(config, secrets, r)
+    elif args.all:
         index_all(config, secrets, r, args.force)
     elif args.pending:
         index_pending(config, secrets, r)

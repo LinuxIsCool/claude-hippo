@@ -6,7 +6,7 @@
 Hippo retrieval pipeline — Pattern Completion.
 
 Given a natural language query, finds seed entities in the knowledge graph,
-runs Personalized PageRank to discover related context, and returns
+runs Personalized PageRank in Python to discover related context, and returns
 ranked results with provenance.
 
 Usage:
@@ -18,9 +18,9 @@ Usage:
 
 import argparse
 import json
-import os
 import re
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 import httpx
@@ -32,6 +32,7 @@ import yaml
 HIPPO_DIR = Path.home() / ".claude" / "local" / "hippo"
 CONFIG_FILE = HIPPO_DIR / "config.yml"
 SECRETS_FILE = Path.home() / ".claude" / "local" / "secrets" / "telus-api.env"
+RETRIEVAL_LOG = HIPPO_DIR / "retrieval-log.jsonl"
 
 
 def load_config() -> dict:
@@ -83,7 +84,6 @@ def extract_query_entities(query: str, secrets: dict) -> list[str]:
     key = secrets.get("TELUS_OLLAMA_KEY", "")
 
     if not url or not key:
-        # Fallback: simple word extraction
         return simple_entity_extract(query)
 
     prompt = f"""Extract the key entities (nouns, proper nouns, concepts) from this query.
@@ -91,7 +91,7 @@ Return ONLY a JSON array of lowercase strings, nothing else.
 
 Query: {query}
 
-Example output: ["falkordb", "knowledge graph", "legion"]"""
+Output format: ["entity1", "entity2"]"""
 
     try:
         with httpx.Client(timeout=15) as client:
@@ -106,7 +106,6 @@ Example output: ["falkordb", "knowledge graph", "legion"]"""
             )
             resp.raise_for_status()
             content = resp.json()["choices"][0]["message"]["content"].strip()
-            # Strip code blocks
             if content.startswith("```"):
                 content = re.sub(r"^```\w*\n?", "", content)
                 content = re.sub(r"\n?```$", "", content)
@@ -130,103 +129,178 @@ def simple_entity_extract(query: str) -> list[str]:
     return [w for w in words if w not in stopwords and len(w) > 1]
 
 
+# --- Embedding utilities ---
+
+def embed_query(text: str, secrets: dict) -> list[float] | None:
+    """Embed a query string via TELUS AI."""
+    url = secrets.get("TELUS_EMBED_URL", "")
+    key = secrets.get("TELUS_EMBED_KEY", "")
+    if not url or not key:
+        return None
+    try:
+        with httpx.Client(timeout=15) as client:
+            resp = client.post(
+                url,
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json={
+                    "input": [text],
+                    "model": "nvidia/nv-embedqa-e5-v5",
+                    "input_type": "query",
+                },
+            )
+            resp.raise_for_status()
+            return resp.json()["data"][0]["embedding"]
+    except Exception:
+        return None
+
+
+def cosine_similarity(a: list[float], b: list[float]) -> float:
+    """Compute cosine similarity between two vectors."""
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(x * x for x in b) ** 0.5
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
 # --- Seed node finding ---
 
-def find_seed_nodes(r: redis.Redis, db: str, entities: list[str]) -> list[str]:
-    """Find graph nodes matching query entities via direct and fuzzy match."""
+def find_seed_nodes(r: redis.Redis, db: str, entities: list[str],
+                    query_embedding: list[float] | None = None) -> list[str]:
+    """Find graph nodes matching query entities via direct match, fuzzy match, and embedding similarity."""
     seeds = set()
 
-    # Direct match
+    # 1. Direct name match
     for entity in entities:
         esc = entity.replace('"', '\\"')
         cypher = f'MATCH (n:Entity) WHERE n.name = "{esc}" RETURN n.name'
         try:
-            result = parse_graph_result(graph_query(r, db, cypher))
-            for row in result:
+            for row in parse_graph_result(graph_query(r, db, cypher)):
                 seeds.add(row["n.name"])
         except redis.exceptions.ResponseError:
             pass
 
-    # Fuzzy/CONTAINS match for entities not found directly
+    # 2. Fuzzy/CONTAINS match for entities not found directly
     for entity in entities:
-        if entity in seeds:
+        if any(entity in s or s in entity for s in seeds):
             continue
         esc = entity.replace('"', '\\"')
         cypher = f'MATCH (n:Entity) WHERE n.name CONTAINS "{esc}" RETURN n.name LIMIT 5'
         try:
-            result = parse_graph_result(graph_query(r, db, cypher))
-            for row in result:
+            for row in parse_graph_result(graph_query(r, db, cypher)):
                 seeds.add(row["n.name"])
+        except redis.exceptions.ResponseError:
+            pass
+
+    # 3. Embedding similarity (if query embedding available and few seeds found)
+    if query_embedding and len(seeds) < 5:
+        cypher = 'MATCH (n:Entity) WHERE n.embedding IS NOT NULL RETURN n.name, n.embedding'
+        try:
+            rows = parse_graph_result(graph_query(r, db, cypher))
+            similarities = []
+            for row in rows:
+                try:
+                    node_emb = json.loads(row["n.embedding"])
+                    sim = cosine_similarity(query_embedding, node_emb)
+                    similarities.append((row["n.name"], sim))
+                except (json.JSONDecodeError, TypeError):
+                    continue
+            # Add top-5 similar entities not already in seeds
+            similarities.sort(key=lambda x: x[1], reverse=True)
+            for name, sim in similarities[:5]:
+                if sim > 0.5 and name not in seeds:
+                    seeds.add(name)
         except redis.exceptions.ResponseError:
             pass
 
     return list(seeds)
 
 
-# --- Personalized PageRank ---
+# --- Pull subgraph into Python ---
 
-def run_ppr(r: redis.Redis, db: str, seeds: list[str],
-            damping: float = 0.85, iterations: int = 20,
-            top_k: int = 10) -> list[dict]:
-    """Run Personalized PageRank from seed nodes.
+def pull_graph(r: redis.Redis, db: str) -> tuple[dict, dict, set, dict]:
+    """Pull the entire edge list into Python for PPR computation.
 
-    Since FalkorDB doesn't have native PPR, we implement it
-    iteratively via Cypher queries.
+    Returns:
+        adj_out: {src: [(dst, weight), ...]}
+        adj_in:  {dst: [(src, weight), ...]}
+        all_nodes: set of all node names
+        edge_meta: {(src, dst): {weight, source}}
     """
-    if not seeds:
-        return []
+    cypher = """
+    MATCH (s:Entity)-[r:RELATES]->(o:Entity)
+    RETURN s.name AS src, o.name AS dst, r.weight AS weight, r.source AS source
+    """
+    rows = parse_graph_result(graph_query(r, db, cypher))
 
-    # Initialize: set ppr scores on all nodes to 0
-    graph_query(r, db, "MATCH (n:Entity) SET n.ppr = 0.0")
+    adj_out = defaultdict(list)
+    adj_in = defaultdict(list)
+    all_nodes = set()
+    edge_meta = {}
 
-    # Set seed scores
-    seed_score = 1.0 / len(seeds)
-    for seed in seeds:
-        esc = seed.replace('"', '\\"')
-        graph_query(r, db, f'MATCH (n:Entity {{name: "{esc}"}}) SET n.ppr = {seed_score}')
+    for row in rows:
+        src = row["src"]
+        dst = row["dst"]
+        w = float(row["weight"]) if row["weight"] else 1.0
+        all_nodes.add(src)
+        all_nodes.add(dst)
+        adj_out[src].append((dst, w))
+        adj_in[dst].append((src, w))
+        edge_meta[(src, dst)] = {"weight": w, "source": row.get("source", "")}
 
-    # Get total node count for teleport
-    result = parse_graph_result(graph_query(r, db, "MATCH (n:Entity) RETURN COUNT(n) AS cnt"))
-    total = result[0]["cnt"] if result else 1
+    return adj_out, adj_in, all_nodes, edge_meta
 
-    # PPR iterations
-    teleport = (1 - damping) / total
-    seed_filter = " OR ".join(f'n.name = "{s.replace(chr(34), chr(92)+chr(34))}"' for s in seeds)
 
-    for i in range(iterations):
-        # Spread activation through edges (weight-aware)
-        cypher = f"""
-        MATCH (n:Entity)-[r:RELATES]->(m:Entity)
-        WHERE n.ppr > 0.001
-        WITH m, SUM(n.ppr * r.weight) AS incoming
-        SET m.ppr = {teleport} + {damping} * incoming
-        """
-        try:
-            graph_query(r, db, cypher)
-        except redis.exceptions.ResponseError as e:
-            print(f"  PPR iteration {i} warning: {e}", file=sys.stderr)
+def run_ppr(adj_out: dict, adj_in: dict, all_nodes: set,
+            seeds: list[str], damping: float = 0.85,
+            iterations: int = 30, epsilon: float = 1e-6) -> dict[str, float]:
+    """Personalized PageRank computed in Python.
+
+    Standard PPR formula:
+      score(v) = (1-d) * personalization(v) + d * sum(score(u) * w(u,v) / out_weight(u))
+
+    where d = damping, personalization is uniform over seeds.
+    Scores are normalized to sum to 1.
+    """
+    n = len(all_nodes)
+    if n == 0:
+        return {}
+
+    # Personalization vector: uniform over seeds
+    seed_set = set(seeds) & all_nodes
+    if not seed_set:
+        return {}
+    p = {node: (1.0 / len(seed_set) if node in seed_set else 0.0) for node in all_nodes}
+
+    # Initialize scores to personalization vector
+    scores = dict(p)
+
+    # Precompute out-degree weight sums for normalization
+    out_weight_sum = {}
+    for node in all_nodes:
+        total = sum(w for _, w in adj_out.get(node, []))
+        out_weight_sum[node] = total if total > 0 else 1.0
+
+    for iteration in range(iterations):
+        new_scores = {}
+        max_delta = 0.0
+
+        for node in all_nodes:
+            # Sum incoming contributions (normalized by source out-weight)
+            incoming = 0.0
+            for src, w in adj_in.get(node, []):
+                incoming += scores.get(src, 0.0) * (w / out_weight_sum[src])
+
+            new_scores[node] = (1 - damping) * p[node] + damping * incoming
+            max_delta = max(max_delta, abs(new_scores[node] - scores.get(node, 0.0)))
+
+        scores = new_scores
+
+        if max_delta < epsilon:
             break
 
-        # Re-inject seed bias (teleport back to seeds)
-        for seed in seeds:
-            esc = seed.replace('"', '\\"')
-            graph_query(r, db,
-                f'MATCH (n:Entity {{name: "{esc}"}}) SET n.ppr = n.ppr + {seed_score * (1 - damping)}')
-
-    # Collect top-K results
-    cypher = f"""
-    MATCH (n:Entity)
-    WHERE n.ppr > 0.001
-    RETURN n.name AS entity, n.ppr AS score
-    ORDER BY n.ppr DESC
-    LIMIT {top_k}
-    """
-    results = parse_graph_result(graph_query(r, db, cypher))
-
-    # Clean up ppr scores
-    graph_query(r, db, "MATCH (n:Entity) SET n.ppr = 0.0")
-
-    return results
+    return scores
 
 
 # --- Context assembly ---
@@ -235,14 +309,12 @@ def get_entity_context(r: redis.Redis, db: str, entity: str) -> list[dict]:
     """Get all relationships for an entity."""
     esc = entity.replace('"', '\\"')
 
-    # Outgoing
     cypher_out = f"""
     MATCH (s:Entity {{name: "{esc}"}})-[r:RELATES]->(o:Entity)
     RETURN s.name AS subject, r.type AS relation, o.name AS object,
            r.source AS source, r.weight AS weight
     ORDER BY r.weight DESC LIMIT 10
     """
-    # Incoming
     cypher_in = f"""
     MATCH (s:Entity)-[r:RELATES]->(o:Entity {{name: "{esc}"}})
     RETURN s.name AS subject, r.type AS relation, o.name AS object,
@@ -251,16 +323,11 @@ def get_entity_context(r: redis.Redis, db: str, entity: str) -> list[dict]:
     """
 
     context = []
-    try:
-        out = parse_graph_result(graph_query(r, db, cypher_out))
-        context.extend(out)
-    except redis.exceptions.ResponseError:
-        pass
-    try:
-        inp = parse_graph_result(graph_query(r, db, cypher_in))
-        context.extend(inp)
-    except redis.exceptions.ResponseError:
-        pass
+    for cypher in [cypher_out, cypher_in]:
+        try:
+            context.extend(parse_graph_result(graph_query(r, db, cypher)))
+        except redis.exceptions.ResponseError:
+            pass
 
     return context
 
@@ -273,7 +340,7 @@ def format_results(ranked: list[dict], contexts: dict[str, list[dict]],
             "results": [
                 {
                     "entity": r["entity"],
-                    "score": round(float(r["score"]), 4),
+                    "score": round(r["score"], 6),
                     "relationships": contexts.get(r["entity"], []),
                 }
                 for r in ranked
@@ -282,21 +349,40 @@ def format_results(ranked: list[dict], contexts: dict[str, list[dict]],
 
     lines = []
     for i, r in enumerate(ranked, 1):
-        score = float(r["score"])
+        score = r["score"]
         entity = r["entity"]
-        lines.append(f"\n{i}. [{score:.3f}] {entity}")
+        lines.append(f"\n{i}. [{score:.4f}] {entity}")
 
         ctx = contexts.get(entity, [])
         seen = set()
         for c in ctx[:5]:
-            triple = f"  {c['subject']} —{c['relation']}→ {c['object']}"
-            if triple not in seen:
-                seen.add(triple)
+            triple_key = f"{c['subject']}|{c['relation']}|{c['object']}"
+            if triple_key not in seen:
+                seen.add(triple_key)
                 source = c.get("source", "")
                 weight = c.get("weight", 1.0)
-                lines.append(f"  {triple}  (w:{weight}, src:{source})")
+                lines.append(f"     {c['subject']} —{c['relation']}→ {c['object']}  (w:{weight}, src:{source})")
 
     return "\n".join(lines)
+
+
+# --- Logging ---
+
+def log_retrieval(query: str, entities: list[str], seeds: list[str],
+                  mode: str, result_count: int):
+    """Log retrieval for consolidation strengthening."""
+    from datetime import datetime, timezone
+    HIPPO_DIR.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "query": query,
+        "entities": entities,
+        "seeds": seeds,
+        "mode": mode,
+        "results": result_count,
+    }
+    with open(RETRIEVAL_LOG, "a") as f:
+        f.write(json.dumps(entry) + "\n")
 
 
 # --- Query modes ---
@@ -312,7 +398,7 @@ def main():
     parser = argparse.ArgumentParser(description="Hippo retrieval — Pattern Completion")
     parser.add_argument("query", help="Natural language query")
     parser.add_argument("--mode", choices=MODES.keys(), default="balanced",
-                        help="Query mode: focused (specific), balanced (default), exploratory (broad)")
+                        help="Query mode: focused, balanced (default), exploratory")
     parser.add_argument("--top", type=int, help="Override top-K results")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     parser.add_argument("--seeds-only", action="store_true",
@@ -334,7 +420,7 @@ def main():
         print("Error: FalkorDB unreachable on port 6380.", file=sys.stderr)
         sys.exit(1)
 
-    # Step 1: Extract entities
+    # Step 1: Extract entities from query
     entities = extract_query_entities(args.query, secrets)
     if not entities:
         print("No entities extracted from query.", file=sys.stderr)
@@ -343,14 +429,15 @@ def main():
     if not args.json:
         print(f"Query entities: {entities}")
 
-    # Step 2: Find seeds
-    seeds = find_seed_nodes(r, db, entities)
+    # Step 2: Find seed nodes (with optional embedding similarity)
+    query_emb = embed_query(args.query, secrets)
+    seeds = find_seed_nodes(r, db, entities, query_embedding=query_emb)
     if not seeds:
         print("No matching nodes found in graph.", file=sys.stderr)
         sys.exit(1)
 
     if not args.json:
-        print(f"Seed nodes: {seeds}")
+        print(f"Seed nodes ({len(seeds)}): {seeds[:10]}{'...' if len(seeds) > 10 else ''}")
 
     if args.seeds_only:
         for s in seeds:
@@ -360,7 +447,7 @@ def main():
                 print(f"  {c['subject']} —{c['relation']}→ {c['object']}  (src:{c.get('source','')})")
         return
 
-    # Step 3: PPR
+    # Step 3: Pull graph and run PPR in Python
     mode = MODES[args.mode]
     top_k = args.top or mode["top_k"]
     damping = mode["damping"]
@@ -368,19 +455,32 @@ def main():
     if not args.json:
         print(f"Running PPR (mode={args.mode}, damping={damping}, top_k={top_k})...")
 
-    ranked = run_ppr(r, db, seeds, damping=damping, top_k=top_k)
+    adj_out, adj_in, all_nodes, edge_meta = pull_graph(r, db)
+
+    if not all_nodes:
+        print("Graph is empty.", file=sys.stderr)
+        sys.exit(1)
+
+    scores = run_ppr(adj_out, adj_in, all_nodes, seeds, damping=damping)
+
+    # Rank by score, exclude near-zero
+    ranked_all = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    ranked = [{"entity": name, "score": score}
+              for name, score in ranked_all[:top_k] if score > 1e-6]
 
     if not ranked:
         print("No results from PPR.", file=sys.stderr)
         sys.exit(1)
 
-    # Step 4: Get context for each result
+    # Step 4: Get context for top results
     contexts = {}
-    for r_item in ranked:
-        entity = r_item["entity"]
-        contexts[entity] = get_entity_context(r, db, entity)
+    for item in ranked:
+        contexts[item["entity"]] = get_entity_context(r, db, item["entity"])
 
-    # Step 5: Format and output
+    # Step 5: Log retrieval (for consolidation strengthening)
+    log_retrieval(args.query, entities, seeds, args.mode, len(ranked))
+
+    # Step 6: Format and output
     output = format_results(ranked, contexts, output_json=args.json)
     print(output)
 

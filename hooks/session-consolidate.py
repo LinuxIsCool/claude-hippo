@@ -2,15 +2,17 @@
 # requires-python = ">=3.11"
 # dependencies = ["pyyaml"]
 # ///
-"""Hippo session consolidation — process pending index queue and log session stats."""
+"""Hippo session end — process pending index queue and report status."""
 
 import json
+import subprocess
 from pathlib import Path
 from datetime import datetime
 
 HIPPO_DIR = Path.home() / ".claude" / "local" / "hippo"
 PENDING_FILE = HIPPO_DIR / ".pending-index"
 CONSOLIDATION_LOG = HIPPO_DIR / "consolidation-log.jsonl"
+SCRIPTS_DIR = Path(__file__).parent.parent / "scripts"
 
 
 def main():
@@ -30,7 +32,6 @@ def main():
 
     if pending > 0:
         parts.append(f"{pending} files queued for indexing.")
-        parts.append("Run /index all to process.")
 
     # Log session end
     log_entry = {
@@ -45,7 +46,6 @@ def main():
 
     if pending > 0:
         print(" ".join(parts))
-    # Silent if nothing pending
 
 
 if __name__ == "__main__":
