@@ -230,7 +230,26 @@ def embed_batch(texts: list[str], secrets: dict, input_type: str = "passage") ->
                     idx = item["index"]
                     results[start + idx] = item["embedding"]
         except (httpx.HTTPError, KeyError, IndexError) as e:
-            print(f"  Warning: Batch embedding failed (offset {start}): {e}", file=sys.stderr)
+            print(f"  Warning: Batch failed (offset {start}), retrying individually: {e}", file=sys.stderr)
+            # Retry each item individually
+            for i, text in enumerate(batch):
+                if not text or not text.strip():
+                    continue
+                try:
+                    with httpx.Client(timeout=15) as client2:
+                        resp2 = client2.post(
+                            url,
+                            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                            json={
+                                "input": [text],
+                                "model": "nvidia/nv-embedqa-e5-v5",
+                                "input_type": input_type,
+                            },
+                        )
+                        resp2.raise_for_status()
+                        results[start + i] = resp2.json()["data"][0]["embedding"]
+                except Exception:
+                    pass  # Skip individual failures silently
 
     return results
 
