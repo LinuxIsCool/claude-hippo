@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "SessionStart": [{
+      "hooks": [{
+        "type": "command",
+        "command": "uv run ${CLAUDE_PLUGIN_ROOT}/hooks/session-memory.py",
+        "timeout": 5
+      }]
+    }],
+    "PostToolUse": [{
+      "matcher": "Write|Edit",
+      "hooks": [{
+        "type": "command",
+        "command": "uv run ${CLAUDE_PLUGIN_ROOT}/hooks/knowledge-event.py",
+        "timeout": 3
+      }]
+    }],
+    "Stop": [{
+      "hooks": [{
+        "type": "command",
+        "command": "uv run ${CLAUDE_PLUGIN_ROOT}/hooks/session-consolidate.py",
+        "timeout": 10
+      }]
+    }]
+  }
+}

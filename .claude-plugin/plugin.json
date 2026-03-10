@@ -1,0 +1,14 @@
+{
+  "name": "claude-hippo",
+  "version": "0.1.0",
+  "description": "Associative memory backbone — HippoRAG-inspired knowledge graph with OpenIE extraction, PPR retrieval, and memory consolidation",
+  "author": {
+    "name": "Shawn Whitney Anderson"
+  },
+  "license": "MIT",
+  "keywords": ["memory", "knowledge-graph", "hipporag", "retrieval", "associative", "consolidation"],
+  "skills": ["./skills/"],
+  "commands": ["./commands/"],
+  "agents": ["./agents/memory-architect.md"],
+  "hooks": "./hooks/hooks.json"
+}
